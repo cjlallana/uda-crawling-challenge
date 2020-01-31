@@ -14,21 +14,26 @@ logging.basicConfig(level=logging.INFO)
 import requests
 from bs4 import BeautifulSoup
 
+from flask import Flask, request
+app = Flask(__name__)
+
+# My own modules
 import sheets_api_wrapper as SHEETS
+
+# Global variables (actually used as constants)
 DRIVE_API_KEYFILE = 'credentials/carlos-lallana_drive-api_uda-challenge.json'
 SPREADSHEET_ID = '1LkOqjyGd1GWiQBwmUQXZuCLKet2YZlhkrc1w884lcMs'
 
-# Global variables (actually used as constants)
 BASE_URL = 'https://www.idealista.com/'
 
-MAX_PROVINCES = 5
-MAX_CITIES_PER_PROVINCE = 5
+MAX_PROVINCES = 2
+MAX_CITIES_PER_PROVINCE = 2
 MAX_STREETS_PER_CITY = 5
 MAX_STREET_NUMBERS_PER_STREET = 5
 
-
+@app.route('/')
 def get():
-	import time
+
 	start_time = time.time()
 	# Create a Session object, wich will persist certain headers and parameters
 	# across requests. It will have all the methods of the main Requests API.
@@ -76,12 +81,17 @@ def get():
 
 	logging.info('Total street numbers retrieved: %s' % len(street_numbers_urls))
 
-	## We reached the last level of crawling, so we start the scraping now
+	## We reached the last level of crawling, so we start the scraping now and
+	## writing the results to a spreadsheet
 	logging.info("Now getting each home's full info...")
-	get_final_data(street_numbers_urls, session, headers)
-	
-	print("--- %s seconds ---" % (time.time() - start_time))
-	return
+	success_counter, error_counter = \
+		prepare_final_data(street_numbers_urls, session, headers)
+
+
+	response_data = {'n_success': success_counter,
+					'n_errors': error_counter}
+
+	return response_data, 200
 
 
 def get_url_content(session=None, url=None, headers=None, n_retries=3):
@@ -93,7 +103,7 @@ def get_url_content(session=None, url=None, headers=None, n_retries=3):
 	:param url: target URL to make the request to
 	:param headers: headers to include in the request
 	:param n_retries: number of retries for the exponential backoff
-	:return: content of the URL when status code is 200
+	:return: content of the URL when status code is 200, or None if other code
 	'''
 	
 	for n in range(0, n_retries + 1):
@@ -120,7 +130,13 @@ def get_url_content(session=None, url=None, headers=None, n_retries=3):
 
 
 def get_provinces_urls(content, limit=None):
-	
+	'''
+	Method that extracts all the provice URLs from the passed content
+
+	:param content: content of a previous Request API response
+	:param limit: limit of provinces retrieved per street
+	:return: list of the retrieved provinces URLs
+	'''
 
 	# List that will contain the provinces URLs found
 	provinces_urls = []
@@ -157,7 +173,8 @@ def get_entities_urls(list_of_urls, session, headers, limit=None):
 	or streets that we want to get the sublinks from.
 	:param session: Requests API Session object
 	:param headers: headers to use on the request
-	:param limit: limit of entities retrieved per street
+	:param limit: limit of entities retrieved per URL
+	:return: list of retrieved entities
 	'''
 
 	# List that will contain all the children entities found
@@ -199,17 +216,22 @@ def get_entities_urls(list_of_urls, session, headers, limit=None):
 	return entities_urls
 
 
-def get_final_data(street_numbers_urls, session, headers, limit=None):
+def prepare_final_data(street_numbers_urls, session, headers, limit=None):
 	'''
 	Method that extracts all the data from a street number page, which
 	contains all the info needed.
 
+	:param street_numbers_urls: list containing all the street numbers URLs 
+	which will be scraped
 	:param session: Requests API Session object
 	:param headers: headers to use on the request
 	:param limit: limit of streets retrieved per street
+	:return: tuple of the success and errors counters
 	'''
 
 	final_result = []
+	success_counter = 0
+	error_counter = 0
 
 	for sn_url in street_numbers_urls:
 
@@ -221,6 +243,7 @@ def get_final_data(street_numbers_urls, session, headers, limit=None):
 									headers=headers)
 
 		if not content:
+			error_counter += 1
 			continue
 
 		# Soupify the retrieved response
@@ -236,7 +259,8 @@ def get_final_data(street_numbers_urls, session, headers, limit=None):
 
 		## GEO data
 		try:
-			# Get what's inside the BUILDING_AREA var in the html <script>
+			# Regex expression to get what's inside the BUILDING_AREA var 
+			# in the html <script> tag related to Google Maps
 			building_area_str = re.compile('var\s+BUILDING_AREA\s+=\s+(.*?);') \
 								.search(content).group(1)
 			
@@ -260,12 +284,14 @@ def get_final_data(street_numbers_urls, session, headers, limit=None):
 							(sn_url, e))
 			
 			full_home_data.append('-')
+			error_counter += 1
 
 		# Get the cadastre properties info
 		info_cadastre = soup.find('div', {'id': 'list-properties-cadastre'})
 		
 		if not info_cadastre:
 			full_home_data.append('No cadastre data')
+			error_counter += 1
 			continue
 
 		## If a street number has more than one home/apartment, there is
@@ -288,9 +314,12 @@ def get_final_data(street_numbers_urls, session, headers, limit=None):
 					final_result.append(
 						full_home_data + [entity for entity in cols if entity])
 
+					success_counter += 1
+
 			except Exception as e:
 				logging.error('Error getting the table info of %s: %s ' %
 								(sn_url, e))
+				error_counter += 1
 
 		else:
 			try:
@@ -301,9 +330,12 @@ def get_final_data(street_numbers_urls, session, headers, limit=None):
 					final_result.append(
 						full_home_data + [entity.text.strip() for entity in lis])
 
+					success_counter += 1
+
 			except Exception as e:
 				logging.error('Error getting the info of %s: %s ' %
 								(sn_url, e))
+				error_counter += 1
 
 
 		# For each 200 records, write them on a Google Spreadsheet and
@@ -317,10 +349,19 @@ def get_final_data(street_numbers_urls, session, headers, limit=None):
 
 	# At the end, write the rest of records to the Spreadsheet
 	logging.info('Writing batch of info to Spreadsheet...')
-	response = append_to_spreadsheet(final_result, SPREADSHEET_ID)
+	append_to_spreadsheet(final_result, SPREADSHEET_ID)
+
+	return success_counter, error_counter
 
 
 def append_to_spreadsheet(values, spreadsheet_id):
+	'''
+	Method that writes the values to a Google Spreadsheet.
+
+	:param values: list of lists, each of them representing a row in the sheet
+	:param spreadsheet_id: ID of the Google Spreadsheet where the info 
+	will be written to
+	'''
 	
 	## Sheets API authorization flow ##
 	keyfile = SHEETS.open_local_keyfile(DRIVE_API_KEYFILE)
@@ -332,7 +373,3 @@ def append_to_spreadsheet(values, spreadsheet_id):
 										spreadsheet_id, 
 										values, 
 										n_retries=1)
-
-
-if __name__ == '__main__':
-	get()
