@@ -14,17 +14,22 @@ logging.basicConfig(level=logging.INFO)
 import requests
 from bs4 import BeautifulSoup
 
+import sheets_api_wrapper as SHEETS
+DRIVE_API_KEYFILE = 'credentials/carlos-lallana_drive-api_uda-challenge.json'
+SPREADSHEET_ID = '1LkOqjyGd1GWiQBwmUQXZuCLKet2YZlhkrc1w884lcMs'
+
 # Global variables (actually used as constants)
 BASE_URL = 'https://www.idealista.com/'
 
-MAX_PROVINCES = 1
-MAX_CITIES_PER_PROVINCE = 2
-MAX_STREETS_PER_CITY = 2
-MAX_STREET_NUMBERS_PER_STREET = 2
+MAX_PROVINCES = 5
+MAX_CITIES_PER_PROVINCE = 5
+MAX_STREETS_PER_CITY = 5
+MAX_STREET_NUMBERS_PER_STREET = 5
 
 
 def get():
-
+	import time
+	start_time = time.time()
 	# Create a Session object, wich will persist certain headers and parameters
 	# across requests. It will have all the methods of the main Requests API.
 	session = requests.Session()
@@ -75,6 +80,7 @@ def get():
 	logging.info("Now getting each home's full info...")
 	get_final_data(street_numbers_urls, session, headers)
 	
+	print("--- %s seconds ---" % (time.time() - start_time))
 	return
 
 
@@ -214,6 +220,9 @@ def get_final_data(street_numbers_urls, session, headers, limit=None):
 									url=sn_url,
 									headers=headers)
 
+		if not content:
+			continue
+
 		# Soupify the retrieved response
 		soup = BeautifulSoup(content, "html.parser")
 
@@ -252,13 +261,19 @@ def get_final_data(street_numbers_urls, session, headers, limit=None):
 			
 			full_home_data.append('-')
 
+		# Get the cadastre properties info
+		info_cadastre = soup.find('div', {'id': 'list-properties-cadastre'})
 		
+		if not info_cadastre:
+			full_home_data.append('No cadastre data')
+			continue
+
 		## If a street number has more than one home/apartment, there is
 		## a table containing all of their info.
 		## But if there is just a single home, then we get a list (<ul> <li>)
 
 		## <TABLE> data
-		info_table = soup.find('table', {'id': 'Vivienda-table'})
+		info_table = info_cadastre.find('table', {'id': 'Vivienda-table'})
 
 		if info_table:
 
@@ -279,7 +294,7 @@ def get_final_data(street_numbers_urls, session, headers, limit=None):
 
 		else:
 			try:
-				info_uls = soup.find_all('ul', {'class': 'table-list'})
+				info_uls = info_cadastre.find_all('ul', {'class': 'table-list'})
 
 				for ul in info_uls:
 					lis = ul.find_all('li')
@@ -290,7 +305,33 @@ def get_final_data(street_numbers_urls, session, headers, limit=None):
 				logging.error('Error getting the info of %s: %s ' %
 								(sn_url, e))
 
-	pprint(final_result)
+
+		# For each 200 records, write them on a Google Spreadsheet and
+		# empty the list to save memory
+		if len(final_result) >= 200:
+			logging.info('Writing batch of info to Spreadsheet...')
+			response = append_to_spreadsheet(final_result, SPREADSHEET_ID)
+			
+			if response:
+				final_result = []
+
+	# At the end, write the rest of records to the Spreadsheet
+	logging.info('Writing batch of info to Spreadsheet...')
+	response = append_to_spreadsheet(final_result, SPREADSHEET_ID)
+
+
+def append_to_spreadsheet(values, spreadsheet_id):
+	
+	## Sheets API authorization flow ##
+	keyfile = SHEETS.open_local_keyfile(DRIVE_API_KEYFILE)
+	credentials = SHEETS.get_credentials_object(keyfile)
+	service = SHEETS.authorize_credentials(credentials)
+	## End of authorization flow ##
+	
+	return SHEETS.append_to_spreadsheet(service, 
+										spreadsheet_id, 
+										values, 
+										n_retries=1)
 
 
 if __name__ == '__main__':
